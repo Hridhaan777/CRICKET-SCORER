@@ -1,0 +1,787 @@
+import React, { useEffect, useMemo, useState } from "react";
+import { motion } from "framer-motion";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Badge } from "@/components/ui/badge";
+import { Flag, Plus, Minus, Undo2, Crown, Shield, Trophy, Users, ListChecks } from "lucide-react";
+
+// ===================== Types =====================
+
+type Batter = {
+  name: string;
+  runs: number;
+  balls: number;
+  fours: number;
+  sixes: number;
+  out: boolean;
+  retiredHurt?: boolean; // does not count to wickets
+};
+
+type Bowler = {
+  name: string;
+  balls: number; // legal balls only
+  runs: number;
+  wickets: number;
+  maidens: number;
+};
+
+type Extras = { b: number; lb: number; w: number; nb: number; p: number };
+
+interface Wicket {
+  batter: string;
+  scoreAtFall: number;
+  overAtFall: string;
+  partnershipRuns: number;
+  partnershipBalls: number;
+  kind: string;
+}
+
+interface Team {
+  id: string;
+  name: string;
+  players: Batter[];
+  bowlers: Bowler[];
+  extras: Extras;
+  total: number; // runs off bat only (for clarity)
+  wickets: number; // dismissals
+  balls: number; // legal balls faced
+  fallOfWickets: Wicket[];
+  partnershipRuns: number; // current stand
+  partnershipBalls: number;
+}
+
+interface Match {
+  id: string;
+  title: string;
+  maxOvers: number;
+  lastManStanding: boolean;
+  teamA: Team;
+  teamB: Team;
+  battingNow: "A" | "B";
+  strikerIndex: number;
+  nonStrikerIndex: number;
+  currentBowlerIndex: number; // index in bowling team
+  target?: number;
+  finished?: boolean;
+  manOfTheMatch?: { name: string; team: "A" | "B" };
+  log: string[]; // ball-by-ball
+}
+
+interface MatchWithHistory {
+  current: Match;
+  history: Match[]; // stack for undo
+}
+
+interface TeamStanding {
+  teamId: string;
+  teamName: string;
+  played: number;
+  won: number;
+  lost: number;
+  tied: number;
+  points: number;
+  runsFor: number;
+  oversFacedBalls: number; // to calc NRR
+  runsAgainst: number;
+  oversBowledBalls: number;
+}
+
+interface PlayerAggregate {
+  playerName: string;
+  teamName: string;
+  runs: number;
+  wickets: number;
+  points: number; // leaderboard points
+}
+
+interface Tournament {
+  id: string;
+  name: string;
+  teams: { id: string; name: string }[];
+  matches: string[]; // match IDs
+  standings: TeamStanding[];
+  leaderboard: PlayerAggregate[];
+  bestPlayerOverride?: string; // manual winner by name (optional)
+}
+
+interface Club {
+  name: string;
+  tournaments: Tournament[];
+}
+
+// ===================== Utils =====================
+
+const UUID = () => Math.random().toString(36).slice(2, 10);
+const ballsToOverString = (balls: number) => `${Math.floor(balls / 6)}.${balls % 6}`;
+const economy = (runs: number, balls: number) => (balls === 0 ? 0 : +(runs / (balls / 6)).toFixed(2));
+const strikeRate = (runs: number, balls: number) => (balls === 0 ? 0 : +((runs * 100) / balls).toFixed(2));
+
+const makePlayers = (prefix: string): Batter[] =>
+  Array.from({ length: 11 }, (_, i) => ({ name: `${prefix} Player ${i + 1}`, runs: 0, balls: 0, fours: 0, sixes: 0, out: false }));
+const makeBowlers = (prefix: string): Bowler[] =>
+  Array.from({ length: 6 }, (_, i) => ({ name: `${prefix} Bowler ${i + 1}`, balls: 0, runs: 0, wickets: 0, maidens: 0 }));
+
+const freshTeam = (id: string, name: string, prefix: string): Team => ({
+  id,
+  name,
+  players: makePlayers(prefix),
+  bowlers: makeBowlers(prefix),
+  extras: { b: 0, lb: 0, w: 0, nb: 0, p: 0 },
+  total: 0,
+  wickets: 0,
+  balls: 0,
+  fallOfWickets: [],
+  partnershipRuns: 0,
+  partnershipBalls: 0,
+});
+
+// ===================== App =====================
+
+export default function CricketScorerPro() {
+  const [club, setClub] = useState<Club>(() => {
+    const saved = localStorage.getItem("hridhaan_club_v1");
+    if (saved) {
+      try { return JSON.parse(saved); } catch {}
+    }
+    return { name: "HRIDHAAN SUPER CRICKET CLUB", tournaments: [] } as Club;
+  });
+
+  const [matchState, setMatchState] = useState<MatchWithHistory>(() => {
+    const saved = localStorage.getItem("hridhaan_match_v2");
+    if (saved) { try { return JSON.parse(saved); } catch {}
+    }
+    const teamA = freshTeam(UUID(), "Team A", "A");
+    const teamB = freshTeam(UUID(), "Team B", "B");
+    const base: Match = {
+      id: UUID(),
+      title: "Gully Cricket Championship",
+      maxOvers: 20,
+      lastManStanding: false,
+      teamA,
+      teamB,
+      battingNow: "A",
+      strikerIndex: 0,
+      nonStrikerIndex: 1,
+      currentBowlerIndex: 0,
+      log: ["Match created. Let's play!"]
+    };
+    return { current: base, history: [] } as MatchWithHistory;
+  });
+
+  const [activeTournamentId, setActiveTournamentId] = useState<string | null>(null);
+  const activeTournament = useMemo(() => club.tournaments.find(t => t.id === activeTournamentId) || null, [club, activeTournamentId]);
+
+  useEffect(() => { localStorage.setItem("hridhaan_club_v1", JSON.stringify(club)); }, [club]);
+  useEffect(() => { localStorage.setItem("hridhaan_match_v2", JSON.stringify(matchState)); }, [matchState]);
+
+  useEffect(() => {
+    localStorage.setItem("hridhaan_match_v1", JSON.stringify(match));
+  }, [match]);
+
+  // ---------- Derived ----------
+  const match = matchState.current;
+  const battingTeam = match.battingNow === "A" ? match.teamA : match.teamB;
+  const bowlingTeam = match.battingNow === "A" ? match.teamB : match.teamA;
+  const striker = battingTeam.players[match.strikerIndex];
+  const nonStriker = battingTeam.players[match.nonStrikerIndex];
+  const bowler = bowlingTeam.bowlers[match.currentBowlerIndex];
+  const extrasTotal = battingTeam.extras.b + battingTeam.extras.lb + battingTeam.extras.w + battingTeam.extras.nb + battingTeam.extras.p;
+  const scoreTotal = battingTeam.total + extrasTotal;
+
+  // History helper
+  const pushHistory = (m: Match) => setMatchState(s => ({ current: m, history: [...s.history.slice(-49), s.current] }));
+  const updateMatch = (mut: (m: Match) => void) => {
+    setMatchState(s => { const next: Match = structuredClone(s.current); mut(next); return { current: next, history: [...s.history.slice(-49), s.current] }; });
+  };
+
+  // ---------- Core Scoring Handlers ----------
+  const rotateStrike = () => updateMatch(m => ({ ...m, strikerIndex: m.nonStrikerIndex, nonStrikerIndex: m.strikerIndex }));
+
+  const endOverIfNeeded = (prev: Match, next: Match) => {
+    if (battingTeam.balls > 0 && battingTeam.balls % 6 === 0) {
+      // maiden check: if no runs conceded in the 6 balls
+      const overRuns = overRunsThisOver(next);
+      if (overRuns === 0) {
+        bowlingTeam.bowlers[next.currentBowlerIndex].maidens += 1;
+      }
+      // swap strike and change bowler
+      next.strikerIndex = prev.nonStrikerIndex;
+      next.nonStrikerIndex = prev.strikerIndex;
+      next.currentBowlerIndex = (prev.currentBowlerIndex + 1) % bowlingTeam.bowlers.length;
+    }
+  };
+
+  const overRunsThisOver = (m: Match) => {
+    // Last 6 legal balls from log, parse runs; simple heuristic
+    const recent = m.log.slice(-12); // enough buffer
+    let legal = 0, runs = 0;
+    for (let i = recent.length - 1; i >= 0 && legal < 6; i--) {
+      const line = recent[i];
+      if (line.includes("(WD)") || line.includes("(NB)")) {
+        // not a legal ball but add run if present
+        const r = line.match(/\+(\d+)/);
+        if (r) runs += Number(r[1]);
+        continue;
+      }
+      legal++;
+      const r = line.match(/runs?:\s(\d+)/);
+      if (r) runs += Number(r[1]);
+    }
+    return runs;
+  };
+
+  const pushLog = (s: string) => updateMatch(m => ({ ...m, log: [...m.log, s] }));
+
+  const legalBallTick = (m: Match) => {
+    const bt = m.battingNow === "A" ? m.teamA : m.teamB;
+    const bl = m.battingNow === "A" ? m.teamB : m.teamA;
+    bt.balls += 1;
+    bl.bowlers[m.currentBowlerIndex].balls += 1;
+  };
+
+  const addRuns = (runs: number) => {
+    updateMatch(prev => {
+      const m = structuredClone(prev) as Match;
+      const bt = m.battingNow === "A" ? m.teamA : m.teamB;
+      const bl = m.battingNow === "A" ? m.teamB : m.teamA;
+      const striker = bt.players[m.strikerIndex];
+      striker.runs += runs;
+      striker.balls += 1;
+      if (runs === 4) striker.fours += 1;
+      if (runs === 6) striker.sixes += 1;
+      bt.total += runs;
+      legalBallTick(m);
+      bl.bowlers[m.currentBowlerIndex].runs += runs;
+      bt.partnershipRuns += runs; bt.partnershipBalls += 1;
+      pushLog(`Ball: runs: ${runs}`);
+      if (runs % 2 === 1) {
+        m.strikerIndex = prev.nonStrikerIndex;
+        m.nonStrikerIndex = prev.strikerIndex;
+      }
+      endOverIfNeeded(prev, m);
+      return m;
+    });
+  };
+
+  const addExtra = (type: keyof Extras, runs: number) => {
+    updateMatch(prev => {
+      const m = structuredClone(prev) as Match;
+      const bt = m.battingNow === "A" ? m.teamA : m.teamB;
+      const bl = m.battingNow === "A" ? m.teamB : m.teamA;
+      bt.extras[type] += runs;
+      // wides/no-balls: add to bowler runs too
+      if (type === "w" || type === "nb") {
+        bl.bowlers[m.currentBowlerIndex].runs += runs;
+        pushLog(`Extra +${runs} (${type.toUpperCase()}) (NB/W D)`);
+        // not a legal ball
+        return m;
+      }
+      // byes/leg-byes are legal deliveries
+      legalBallTick(m);
+      bl.bowlers[m.currentBowlerIndex].runs += 0; // no batsman runs
+      bt.partnershipBalls += 1;
+      pushLog(`Extra +${runs} (${type.toUpperCase()})`);
+      endOverIfNeeded(prev, m);
+      return m;
+    });
+  };
+
+  const wicket = (kind: string) => {
+    updateMatch(prev => {
+      const m = structuredClone(prev) as Match;
+      const bt = m.battingNow === "A" ? m.teamA : m.teamB;
+      const bl = m.battingNow === "A" ? m.teamB : m.teamA;
+      const striker = bt.players[m.strikerIndex];
+      striker.out = true;
+      bt.wickets += 1;
+      legalBallTick(m);
+      bl.bowlers[m.currentBowlerIndex].wickets += 1;
+      bt.partnershipBalls += 1;
+      bt.fallOfWickets.push({
+        batter: striker.name,
+        scoreAtFall: bt.total + bt.extras.b + bt.extras.lb + bt.extras.nb + bt.extras.w + bt.extras.p,
+        overAtFall: ballsToOverString(bt.balls),
+        partnershipRuns: bt.partnershipRuns,
+        partnershipBalls: bt.partnershipBalls,
+        kind,
+      });
+      pushLog(`WICKET: ${striker.name} (${kind})`);
+      // reset partnership
+      bt.partnershipRuns = 0; bt.partnershipBalls = 0;
+      // send next batter if available
+      const nextIndex = bt.players.findIndex((p, idx) => !p.out && !p.retiredHurt && idx !== m.strikerIndex && idx !== m.nonStrikerIndex);
+      if (nextIndex !== -1) {
+        m.strikerIndex = nextIndex;
+      } else {
+        // check LMS
+        if (!m.lastManStanding && bt.wickets >= 10) m.finished = true;
+      }
+      endOverIfNeeded(prev, m);
+      return m;
+    });
+  };
+
+  const retiredHurt = (idx: number) => {
+    updateMatch(prev => {
+      const m = structuredClone(prev) as Match;
+      const bt = m.battingNow === "A" ? m.teamA : m.teamB;
+      const p = bt.players[idx];
+      p.retiredHurt = true; p.out = false; // not a wicket
+      pushLog(`Retired hurt: ${p.name}`);
+      // bring next batter in if this was striker/non-striker
+      if (idx === m.strikerIndex || idx === m.nonStrikerIndex) {
+        const next = bt.players.findIndex((pp, i) => !pp.out && !pp.retiredHurt && i !== m.strikerIndex && i !== m.nonStrikerIndex);
+        if (next !== -1) {
+          if (idx === m.strikerIndex) m.strikerIndex = next; else m.nonStrikerIndex = next;
+        }
+      }
+      return m;
+    });
+  };
+
+  // Penalty runs (manual or +5 quick)
+  const addPenalty = (runs: number) => {
+    updateMatch(prev => {
+      const m = structuredClone(prev) as Match;
+      const bt = m.battingNow === "A" ? m.teamA : m.teamB;
+      bt.extras.p += runs;
+      pushLog(`PENALTY +${runs}`);
+      return m;
+    });
+  };
+
+  // ---------- Post Match ----------
+  const endInnings = () => updateMatch(m => ({ ...m, finished: true }));
+
+  const autoManOfTheMatch = (): { name: string; team: "A" | "B" } => {
+    const a = match.teamA.players.map(p => ({ name: p.name, team: "A" as const, pts: p.runs }))
+      .concat(match.teamB.players.map(p => ({ name: p.name, team: "B" as const, pts: p.runs })));
+    // basic: runs only (could mix wickets if we tracked per bowler player names mapping)
+    const best = a.sort((x, y) => y.pts - x.pts)[0];
+    return { name: best?.name || "", team: best?.team || "A" };
+  };
+
+  const setManOfTheMatch = (name: string, team: "A" | "B") => updateMatch(m => ({ ...m, manOfTheMatch: { name, team } }));
+
+  // ---------- Tournament helpers ----------
+  const ensureTournament = () => {
+    if (!activeTournament) return;
+    setClub(prev => ({ ...prev }));
+  };
+
+  const recordMatchToTournament = () => {
+    if (!activeTournament) return;
+    const t = club.tournaments.find(tt => tt.id === activeTournament.id)!;
+    // add match id
+    if (!t.matches.includes(match.id)) t.matches.push(match.id);
+    // update standings for both teams
+    const updateStanding = (team: Team, opp: Team, won: boolean, tied: boolean) => {
+      let st = t.standings.find(s => s.teamId === team.id);
+      if (!st) {
+        st = { teamId: team.id, teamName: team.name, played: 0, won: 0, lost: 0, tied: 0, points: 0, runsFor: 0, oversFacedBalls: 0, runsAgainst: 0, oversBowledBalls: 0 };
+        t.standings.push(st);
+      }
+      st.played += 1;
+      if (won) { st.won += 1; st.points += 2; }
+      else if (tied) { st.tied += 1; st.points += 1; }
+      else { st.lost += 1; }
+      const teamRuns = team.total + team.extras.b + team.extras.lb + team.extras.nb + team.extras.w + team.extras.p;
+      const oppRuns = opp.total + opp.extras.b + opp.extras.lb + opp.extras.nb + opp.extras.w + opp.extras.p;
+      st.runsFor += teamRuns; st.runsAgainst += oppRuns;
+      st.oversFacedBalls += team.balls; st.oversBowledBalls += opp.balls;
+    };
+
+    const aRuns = match.teamA.total + Object.values(match.teamA.extras).reduce((a, b) => a + b, 0);
+    const bRuns = match.teamB.total + Object.values(match.teamB.extras).reduce((a, b) => a + b, 0);
+    const tied = aRuns === bRuns;
+    updateStanding(match.teamA, match.teamB, aRuns > bRuns, tied);
+    updateStanding(match.teamB, match.teamA, bRuns > aRuns, tied);
+
+    // leaderboard: aggregate simple points (1 per run, 20 per wicket) from visible scorecards
+    const addAgg = (team: Team) => {
+      team.players.forEach(p => {
+        const pts = p.runs; // (add wickets per player if tracked)
+        const existing = t.leaderboard.find(l => l.playerName === p.name && l.teamName === team.name);
+        if (existing) { existing.runs += p.runs; existing.points += pts; }
+        else t.leaderboard.push({ playerName: p.name, teamName: team.name, runs: p.runs, wickets: 0, points: pts });
+      });
+      team.bowlers.forEach(b => {
+        if (b.wickets > 0 || b.runs > 0) {
+          const name = b.name;
+          const existing = t.leaderboard.find(l => l.playerName === name && l.teamName === (team === match.teamA ? match.teamB.name : match.teamA.name));
+          // Bowler belongs to bowling side (opposite team name shown already on team object); keep simple: attach to bowling team name
+        }
+      });
+    };
+    addAgg(match.teamA);
+    addAgg(match.teamB);
+
+    setClub(prev => ({ ...prev }));
+  };
+
+  // ===================== UI =====================
+
+  const [customPenalty, setCustomPenalty] = useState<number>(5);
+  const [customOvers, setCustomOvers] = useState<number>(20);
+  const [newClubName, setNewClubName] = useState(club.name);
+  const [newTournamentName, setNewTournamentName] = useState("");
+
+  const createTournament = () => {
+    const t: Tournament = { id: UUID(), name: newTournamentName || `Tournament ${club.tournaments.length + 1}` , teams: [ {id: match.teamA.id, name: match.teamA.name}, {id: match.teamB.id, name: match.teamB.name}], matches: [], standings: [], leaderboard: [] };
+    setClub(prev => ({ ...prev, tournaments: [...prev.tournaments, t] }));
+    setActiveTournamentId(t.id);
+  };
+
+  const nrr = (s: TeamStanding) => {
+    const forRR = s.oversFacedBalls === 0 ? 0 : s.runsFor / (s.oversFacedBalls / 6);
+    const againstRR = s.oversBowledBalls === 0 ? 0 : s.runsAgainst / (s.oversBowledBalls / 6);
+    return +(forRR - againstRR).toFixed(3);
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-sky-50 to-emerald-50 p-4 md:p-6">
+      <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }} className="max-w-6xl mx-auto">
+        <header className="flex items-center justify-between mb-4">
+          <div>
+            <h1 className="text-2xl md:text-3xl font-bold tracking-tight">Cricket Scorer <span className="text-emerald-600">PRO</span></h1>
+            <p className="text-sm opacity-80">Made by <span className="font-semibold">HRIDHAAN</span> 🏏</p>
+          </div>
+          <div className="text-right">
+            <Input value={newClubName} onChange={(e)=>setNewClubName(e.target.value)} onBlur={()=>setClub(c=>({...c, name:newClubName||c.name}))} className="max-w-xs" />
+            <p className="text-xs opacity-60">Club Name</p>
+          </div>
+        </header>
+
+        <Tabs defaultValue="score" className="w-full">
+          <TabsList className="grid grid-cols-4 w-full">
+            <TabsTrigger value="score">Scoring</TabsTrigger>
+            <TabsTrigger value="card">Scorecard</TabsTrigger>
+            <TabsTrigger value="tournament">Tournament</TabsTrigger>
+            <TabsTrigger value="standings">Standings & Leaderboard</TabsTrigger>
+          </TabsList>
+
+          {/* ========== SCORING TAB ========== */}
+          <TabsContent value="score">
+            <Card className="shadow-sm mb-4">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2"><Flag className="w-5 h-5"/> Match Setup</CardTitle>
+              </CardHeader>
+              <CardContent className="grid md:grid-cols-3 gap-3">
+                <div>
+                  <label className="text-xs">Match Title</label>
+                  <Input value={match.title} onChange={e=>updateMatch(m=>({...m,title:e.target.value}))}/>
+                </div>
+                <div>
+                  <label className="text-xs">Max Overs</label>
+                  <Input type="number" value={match.maxOvers} onChange={(e)=>updateMatch(m=>({...m, maxOvers: Math.max(1, Number(e.target.value)||1)}))} onBlur={()=>setCustomOvers(match.maxOvers)}/>
+                </div>
+                <div>
+                  <label className="text-xs">Last Man Standing</label>
+                  <Select value={String(match.lastManStanding)} onValueChange={(v:any)=>updateMatch(m=>({...m, lastManStanding: v==="true"}))}>
+                    <SelectTrigger><SelectValue/></SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        <SelectItem value="false">Off</SelectItem>
+                        <SelectItem value="true">On</SelectItem>
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card className="shadow-sm">
+              <CardHeader>
+                <CardTitle>Scoreboard</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="grid md:grid-cols-3 gap-3 items-start">
+                  <div>
+                    <div className="text-lg font-semibold">{match.battingNow === "A" ? match.teamA.name : match.teamB.name}</div>
+                    <div className="text-4xl font-extrabold">{scoreTotal}/{battingTeam.wickets} <span className="text-base">({ballsToOverString(battingTeam.balls)} ov)</span></div>
+                    <div className="text-sm mt-1">Extras: B {battingTeam.extras.b}, LB {battingTeam.extras.lb}, W {battingTeam.extras.w}, NB {battingTeam.extras.nb}, P {battingTeam.extras.p}</div>
+                    <div className="text-sm mt-2 cursor-pointer" onClick={rotateStrike}>Striker: <b>{striker.name}</b> ({striker.runs}/{striker.balls}) • NS: <b>{nonStriker.name}</b> ({nonStriker.runs}/{nonStriker.balls})</div>
+                    <div className="text-xs opacity-70">(tap to rotate strike)</div>
+                    <div className="text-sm mt-2">Current Bowler: <b>{bowler.name}</b> — {ballsToOverString(bowler.balls)} ov, {bowler.runs} R, {bowler.wickets} W, Econ {economy(bowler.runs, bowler.balls)}</div>
+                    <div className="text-sm mt-2 font-medium">Partnership: {battingTeam.partnershipRuns} ({battingTeam.partnershipBalls}b)</div>
+                  </div>
+
+                  <div className="flex flex-wrap gap-2">
+                    {[0,1,2,3,4,6].map(r=> (
+                      <Button key={r} onClick={()=>addRuns(r)} className="rounded-2xl">+{r}</Button>
+                    ))}
+                    <Button variant="secondary" onClick={()=>addExtra("w",1)}>Wide +1</Button>
+                    <Button variant="secondary" onClick={()=>addExtra("nb",1)}>No Ball +1</Button>
+                    <Button variant="secondary" onClick={()=>addExtra("b",1)}>Bye +1</Button>
+                    <Button variant="secondary" onClick={()=>addExtra("lb",1)}>Leg Bye +1</Button>
+                    <Button variant="destructive" onClick={()=>wicket("Out")}>Wicket</Button>
+                    <Button variant="outline" onClick={()=> setMatchState(s=> (s.history.length? { current: s.history[s.history.length-1], history: s.history.slice(0,-1)}: s))}><Undo2 className="w-4 h-4 mr-1"/> Undo</Button>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <Button variant="outline" onClick={()=>addPenalty(5)}><Shield className="w-4 h-4 mr-1"/> +5 Penalty</Button>
+                      <Input type="number" className="w-24" value={customPenalty} onChange={(e)=>setCustomPenalty(Number(e.target.value)||0)} />
+                      <Button variant="outline" onClick={()=>addPenalty(customPenalty)}>Add Custom</Button>
+                    </div>
+                    <div>
+                      <label className="text-xs">Retired Hurt</label>
+                      <Select onValueChange={(v:any)=>retiredHurt(Number(v))}>
+                        <SelectTrigger><SelectValue placeholder="Select batter"/></SelectTrigger>
+                        <SelectContent>
+                          <SelectGroup>
+                            {battingTeam.players.map((p,i)=> (
+                              <SelectItem key={i} value={String(i)} disabled={p.out || p.retiredHurt}>{p.name}</SelectItem>
+                            ))}
+                          </SelectGroup>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="flex gap-2">
+                      <Button variant="outline" onClick={()=>updateMatch(m=>({...m, battingNow: m.battingNow === "A" ? "B":"A"}))}>Switch Innings</Button>
+                      <Button variant="outline" onClick={endInnings}>End Innings</Button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-4 p-3 rounded-lg bg-white/60">
+                  <div className="font-semibold mb-2">Live Commentary</div>
+                  <div className="max-h-40 overflow-auto text-sm space-y-1">
+                    {match.log.map((l,idx)=> (<div key={idx}>• {l}</div>))}
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          {/* ===== Rain Target Helper (Resource-based, manual) ===== */}
+          <TabsContent value="score">
+            <Card className="mt-4">
+              <CardHeader><CardTitle>Rain Target Helper (manual resources)</CardTitle></CardHeader>
+              <CardContent className="grid md:grid-cols-5 gap-3 items-end">
+                <div>
+                  <label className="text-xs">Team 1 Score (S1)</label>
+                  <Input type="number" defaultValue={match.teamA.total + match.teamA.extras.b + match.teamA.extras.lb + match.teamA.extras.nb + match.teamA.extras.w + match.teamA.extras.p} id="s1" />
+                </div>
+                <div>
+                  <label className="text-xs">Team 1 Resources % (R1)</label>
+                  <Input type="number" defaultValue={100} id="r1" />
+                </div>
+                <div>
+                  <label className="text-xs">Team 2 Resources % (R2)</label>
+                  <Input type="number" defaultValue={100} id="r2" />
+                </div>
+                <div className="col-span-2">
+                  <Button onClick={() => {
+                    const s1 = Number((document.getElementById('s1') as HTMLInputElement).value)||0;
+                    const r1 = Number((document.getElementById('r1') as HTMLInputElement).value)||0;
+                    const r2 = Number((document.getElementById('r2') as HTMLInputElement).value)||0;
+                    const par = r1===0? 0 : Math.floor(s1 * (r2/Math.max(1,r1)));
+                    const target = par + 1;
+                    alert(`Par: ${par}
+Target: ${target}`);
+                  }}>Compute Par/Target</Button>
+                  <div className="text-xs opacity-60 mt-1">Formula: Par = floor(S1 × R2/R1). Enter resource percentages manually.</div>
+                </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          {/* ========== SCORECARD TAB ========== */}
+          <TabsContent value="card">
+            <div className="grid md:grid-cols-2 gap-4">
+              {[{team: match.teamA, tag: "A" as const}, {team: match.teamB, tag: "B" as const}].map(({team, tag}) => (
+                <Card key={team.id}>
+                  <CardHeader><CardTitle>{team.name} — {team.total + team.extras.b + team.extras.lb + team.extras.nb + team.extras.w + team.extras.p}/{team.wickets} ({ballsToOverString(team.balls)} ov)</CardTitle></CardHeader>
+                  <CardContent>
+                    <div className="text-sm mb-2">Extras: B {team.extras.b}, LB {team.extras.lb}, W {team.extras.w}, NB {team.extras.nb}, P {team.extras.p}</div>
+                    <table className="w-full text-sm">
+                      <thead><tr className="border-b"><th className="text-left">Batter</th><th>R</th><th>B</th><th>4s</th><th>6s</th><th>SR</th><th>Status</th></tr></thead>
+                      <tbody>
+                        {team.players.map((p,i)=> (
+                          <tr key={i} className="border-b hover:bg-emerald-50 cursor-pointer" onClick={()=>updateMatch(m=> ({...m, strikerIndex: i, nonStrikerIndex: m.strikerIndex}))}>
+                            <td>{p.name}{(match.battingNow === tag && i===match.strikerIndex)?" *":""}</td>
+                            <td>{p.runs}</td>
+                            <td>{p.balls}</td>
+                            <td>{p.fours}</td>
+                            <td>{p.sixes}</td>
+                            <td>{strikeRate(p.runs,p.balls)}</td>
+                            <td>{p.retiredHurt? <Badge variant="secondary">Retired Hurt</Badge> : p.out? "Out" : "Not Out"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+
+                    <div className="mt-4 font-semibold">Bowling</div>
+                    <table className="w-full text-sm">
+                      <thead><tr className="border-b"><th className="text-left">Bowler</th><th>O</th><th>R</th><th>W</th><th>M</th><th>Econ</th></tr></thead>
+                      <tbody>
+                        {(tag === "A" ? match.teamB.bowlers : match.teamA.bowlers).map((b,i)=> (
+                          <tr key={i} className="border-b">
+                            <td>{b.name}</td>
+                            <td>{ballsToOverString(b.balls)}</td>
+                            <td>{b.runs}</td>
+                            <td>{b.wickets}</td>
+                            <td>{b.maidens}</td>
+                            <td>{economy(b.runs,b.balls)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+
+                    <div className="mt-4">
+                      <div className="font-semibold">Fall of Wickets</div>
+                      {team.fallOfWickets.length===0? <div className="text-sm opacity-60">—</div> :
+                        <ul className="text-sm list-disc pl-4">
+                          {team.fallOfWickets.map((w,i)=>(<li key={i}>{w.batter} — {w.scoreAtFall}/{i+1} ({w.overAtFall}) {w.kind}; Partnership {w.partnershipRuns} ({w.partnershipBalls}b)</li>))}
+                        </ul>}
+                    </div>
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+
+            <Card className="mt-4">
+              <CardHeader><CardTitle><Crown className="inline w-5 h-5 mr-2"/> Man of the Match</CardTitle></CardHeader>
+              <CardContent className="flex gap-2 items-center">
+                <Button variant="outline" onClick={()=>{
+                  const auto = autoManOfTheMatch();
+                  setManOfTheMatch(auto.name, auto.team);
+                }}>Suggest Automatically</Button>
+                <Select onValueChange={(v:any)=>{
+                  const [team,name] = v.split("|:");
+                  setManOfTheMatch(name, team as any);
+                }}>
+                  <SelectTrigger className="max-w-xs"><SelectValue placeholder={match.manOfTheMatch? `${match.manOfTheMatch.name} (${match.manOfTheMatch.team})` : "Pick player"}/></SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      {match.teamA.players.map((p,i)=>(<SelectItem key={`A${i}`} value={`A|:${p.name}`}>{p.name} – {match.teamA.name}</SelectItem>))}
+                      {match.teamB.players.map((p,i)=>(<SelectItem key={`B${i}`} value={`B|:${p.name}`}>{p.name} – {match.teamB.name}</SelectItem>))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+                {match.manOfTheMatch && <Badge className="ml-2">{match.manOfTheMatch.name} ({match.manOfTheMatch.team})</Badge>}
+                <Button className="ml-auto" onClick={recordMatchToTournament}><Trophy className="w-4 h-4 mr-2"/>Record to Tournament</Button>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          {/* ========== TOURNAMENT TAB ========== */}
+          <TabsContent value="tournament">
+            <Card className="mb-4">
+              <CardHeader><CardTitle>Club & Tournaments</CardTitle></CardHeader>
+              <CardContent className="space-y-3">
+                <div className="flex gap-2 items-end">
+                  <div className="flex-1">
+                    <label className="text-xs">New Tournament Name</label>
+                    <Input value={newTournamentName} onChange={(e)=>setNewTournamentName(e.target.value)} placeholder="e.g. HRIDHAAN Premier League"/>
+                  </div>
+                  <Button onClick={createTournament}><Plus className="w-4 h-4 mr-1"/>Create</Button>
+                </div>
+                {club.tournaments.length===0? <div className="text-sm opacity-60">No tournaments yet.</div> : (
+                  <div className="flex flex-wrap gap-2">
+                    {club.tournaments.map(t=> (
+                      <Button key={t.id} variant={activeTournamentId===t.id?"default":"outline"} onClick={()=>setActiveTournamentId(t.id)}>{t.name}</Button>
+                    ))}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {activeTournament && (
+              <Card>
+                <CardHeader><CardTitle>{activeTournament.name} — Teams</CardTitle></CardHeader>
+                <CardContent>
+                  <div className="flex flex-wrap gap-2 mb-3">
+                    {activeTournament.teams.map(tm => (<Badge key={tm.id} variant="secondary">{tm.name}</Badge>))}
+                  </div>
+                  <div className="text-sm opacity-60">Current match will be linked when you click <b>Record to Tournament</b> in the Scorecard tab.</div>
+                </CardContent>
+              </Card>
+            )}
+          </TabsContent>
+
+          {/* ========== STANDINGS & LEADERBOARD TAB ========== */}
+          <TabsContent value="standings">
+            {!activeTournament ? (
+              <div className="text-sm opacity-60">Select or create a tournament first.</div>
+            ) : (
+              <div className="grid md:grid-cols-2 gap-4">
+                <Card>
+                  <CardHeader><CardTitle><Users className="inline w-5 h-5 mr-2"/> Points Table</CardTitle></CardHeader>
+                  <CardContent>
+                    <table className="w-full text-sm">
+                      <thead><tr className="border-b"><th className="text-left">Team</th><th>M</th><th>W</th><th>L</th><th>T</th><th>Pts</th><th>NRR</th></tr></thead>
+                      <tbody>
+                        {activeTournament.standings.sort((a,b)=> b.points - a.points || nrr(b) - nrr(a)).map((s,i)=> (
+                          <tr key={s.teamId} className="border-b">
+                            <td>{i+1}. {s.teamName}</td>
+                            <td>{s.played}</td>
+                            <td>{s.won}</td>
+                            <td>{s.lost}</td>
+                            <td>{s.tied}</td>
+                            <td>{s.points}</td>
+                            <td>{nrr(s)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </CardContent>
+                </Card>
+
+                <Card>
+                  <CardHeader><CardTitle><ListChecks className="inline w-5 h-5 mr-2"/> Player Leaderboard</CardTitle></CardHeader>
+                  <CardContent>
+                    <table className="w-full text-sm">
+                      <thead><tr className="border-b"><th className="text-left">Player</th><th>Team</th><th>Runs</th><th>Wkts</th><th>Pts</th></tr></thead>
+                      <tbody>
+                        {activeTournament.leaderboard.sort((a,b)=> b.points - a.points).map((p,i)=> (
+                          <tr key={`${p.playerName}-${i}`} className="border-b">
+                            <td>{i+1}. {p.playerName}</td>
+                            <td>{p.teamName}</td>
+                            <td>{p.runs}</td>
+                            <td>{p.wickets}</td>
+                            <td>{p.points}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </CardContent>
+                </Card>
+
+                <Card className="md:col-span-2">
+                  <CardHeader><CardTitle><Crown className="inline w-5 h-5 mr-2"/> Best Player of the Tournament</CardTitle></CardHeader>
+                  <CardContent className="flex flex-wrap gap-2 items-center">
+                    {activeTournament.leaderboard.length===0? <div className="text-sm opacity-60">No data yet.</div> : (
+                      <>
+                        <Badge variant="default">Auto: {activeTournament.leaderboard.slice().sort((a,b)=>b.points - a.points)[0].playerName}</Badge>
+                        <Select onValueChange={(v:any)=>{
+                          const t = club.tournaments.find(tt=>tt.id===activeTournament.id)!;
+                          t.bestPlayerOverride = v;
+                          setClub(prev=>({...prev}));
+                        }}>
+                          <SelectTrigger className="max-w-xs"><SelectValue placeholder={activeTournament.bestPlayerOverride? `Manual: ${activeTournament.bestPlayerOverride}`:"Override manually"}/></SelectTrigger>
+                          <SelectContent>
+                            <SelectGroup>
+                              {activeTournament.leaderboard.map((p,i)=>(<SelectItem key={i} value={p.playerName}>{p.playerName} – {p.teamName}</SelectItem>))}
+                            </SelectGroup>
+                          </SelectContent>
+                        </Select>
+                      </>
+                    )}
+                  </CardContent>
+                </Card>
+              </div>
+            )}
+          </TabsContent>
+        </Tabs>
+
+        <footer className="mt-6 text-center text-xs opacity-60">© {new Date().getFullYear()} Made by HRIDHAAN • All Rights Reserved</footer>
+      </motion.div>
+    </div>
+  );
+}
